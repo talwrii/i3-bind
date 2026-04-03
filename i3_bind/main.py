@@ -87,6 +87,12 @@ def backup(config_path):
 
 
 def do_add(key, command, mode, config_path):
+    # Check for existing binding with same key in same mode
+    for existing_mode, existing_key, _ in iter_bindings(config_path):
+        if existing_mode == mode and existing_key == key:
+            die(f"binding already exists: {key}" +
+                (f" in mode {mode}" if mode != "default" else "") +
+                " (delete it first)")
     text = config_path.read_text()
     line = f"bindsym {key} {command}\n"
     backup(config_path)
