@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "i3-bind"
-version = "1.0.0"
+version = "1.0.1"
 description = "Add, remove, and list i3 keybindings from the command line"
 readme = "README.md"
 license = "MIT"
