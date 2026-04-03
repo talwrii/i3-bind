@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "i3-bind"
+version = "0.1.0"
+description = "Add, remove, and list i3 keybindings from the command line"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.9"
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Topic :: Desktop Environment",
+]
+
+[[project.authors]]
+name = "readwithai"
+
+[project.urls]
+Homepage = "https://github.com/readwithai/i3-bind"
+
+[project.scripts]
+i3-bind = "i3_bind.main:main"
