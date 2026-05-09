@@ -12,6 +12,10 @@ import argparse
 from pathlib import Path
 from typing import Optional
 
+# ── Errors ────────────────────────────────────────────────────────────────────
+class BindError(Exception):
+    """A binding operation could not be performed."""
+
 # ── Config discovery ──────────────────────────────────────────────────────────
 CONFIG_PATHS = [
     Path.home() / ".config/i3/config",
@@ -34,9 +38,9 @@ def die(msg):
     print(f"i3-bind: {msg}", file=sys.stderr)
     sys.exit(1)
 
-# ── Key normalization ─────────────────────────────────────────────────────────
-# Maps every accepted modifier spelling to its canonical i3 form.
-# Friendly aliases (super, meta, win, alt) resolve to the corresponding ModN.
+# ── Key normalization (for comparison) ────────────────────────────────────────
+# Used internally for duplicate detection and lookup. Aliases (super/meta/win/
+# alt/ctrl) all collapse onto i3's underlying ModN/Control names.
 MODIFIER_CANON = {
     "ctrl": "control", "control": "control",
     "shift": "shift",
@@ -49,11 +53,11 @@ MODIFIER_CANON = {
 VALID_MODIFIERS = set(MODIFIER_CANON.keys())
 
 def normalize_key(key, mod_var):
-    """Return a canonical form of a binding key string.
+    """Canonical form of a binding key string (for comparison only).
 
-    Modifier names are lowercased and aliased (ctrl→control, super→mod4, etc.),
-    $mod is resolved, modifiers are sorted (state mask is order-independent),
-    and an uppercase single-letter keysym is lifted to Shift+<lower>.
+    Modifier names are lowercased and aliased, $mod is resolved, modifiers are
+    sorted (state mask is order-independent), and an uppercase single-letter
+    keysym is lifted to Shift+<lower>.
     """
     parts = key.split("+")
     *mods, keysym = parts
@@ -69,19 +73,54 @@ def normalize_key(key, mod_var):
     canon_mods.sort()
     return "+".join(canon_mods + [keysym])
 
-# ── Parsing ───────────────────────────────────────────────────────────────────
-def get_mod_var(config_path):
-    for line in config_path.read_text().splitlines():
+def validate_key(key):
+    parts = key.split("+")
+    for mod in parts[:-1]:
+        if mod.startswith("$"):
+            continue
+        if mod.lower() not in VALID_MODIFIERS:
+            raise BindError(
+                f"unknown modifier {mod!r} in {key!r}; "
+                f"valid: Shift, Control/Ctrl, Alt, Super/Meta/Win, "
+                f"Mod1-Mod5, or $variable.")
+
+# ── Key form for writing to the config ────────────────────────────────────────
+# i3 only understands Shift / Lock / Control / Mod1..Mod5 as modifier names.
+# Friendly aliases that the user is allowed to type get translated here.
+WRITE_ALIASES = {
+    "super": "Mod4", "meta": "Mod4", "win": "Mod4",
+    "alt":   "Mod1",
+    "ctrl":  "Control",
+}
+
+def to_i3_form(key):
+    """Rewrite friendly aliases into forms i3 actually accepts.
+
+    Keysym, $variables, and capitalisation of already-canonical modifier
+    names are left untouched.
+    """
+    parts = key.split("+")
+    *mods, keysym = parts
+    out = []
+    for m in mods:
+        if m.startswith("$"):
+            out.append(m)
+        else:
+            out.append(WRITE_ALIASES.get(m.lower(), m))
+    return "+".join(out + [keysym])
+
+# ── Pure text transforms ──────────────────────────────────────────────────────
+def _get_mod_var_text(text):
+    for line in text.splitlines():
         m = re.match(r'^set\s+\$mod\s+(\S+)', line)
         if m:
             return m.group(1)
     return "Mod4"
 
-def iter_bindings(config_path):
-    mod_var      = get_mod_var(config_path)
+def _iter_bindings_text(text, mod_var):
     current_mode = "default"
     brace_depth  = 0
-    for raw in config_path.read_text().splitlines():
+    for raw in text.splitlines():
         line = raw.strip()
         if line.startswith("#"):
             continue
@@ -106,51 +145,32 @@ def iter_bindings(config_path):
             key = normalize_key(m.group(1), mod_var)
             yield current_mode, key, m.group(2).strip()
 
-# ── Config writing ────────────────────────────────────────────────────────────
-def backup(config_path):
-    shutil.copy2(config_path, config_path.with_suffix(".bak"))
-
-def validate_key(key):
-    parts = key.split("+")
-    for mod in parts[:-1]:
-        if mod.startswith("$"):
-            continue
-        if mod.lower() not in VALID_MODIFIERS:
-            die(f"unknown modifier {mod!r} in {key!r}; "
-                f"valid: Shift, Control/Ctrl, Alt, Super/Meta/Win, "
-                f"Mod1-Mod5, or $variable.")
-
-def do_add(key, command, mode, config_path):
+def _apply_add(text, key, command, mode, mod_var):
+    """Add a binding. Returns new text. Raises BindError on conflict."""
     validate_key(key)
-    mod_var = get_mod_var(config_path)
     norm = normalize_key(key, mod_var)
-    for existing_mode, existing_key, _ in iter_bindings(config_path):
+    for existing_mode, existing_key, existing_cmd in _iter_bindings_text(text, mod_var):
         if existing_mode == mode and existing_key == norm:
-            die(f"binding already exists: {key}" +
+            raise BindError(
+                f"binding already exists: {key} → {existing_cmd}" +
                 (f" in mode {mode}" if mode != "default" else "") +
                 " (delete it first)")
-
-    text = config_path.read_text()
-    line = f"bindsym {key} {command}\n"
-    backup(config_path)
-
+    line = f"bindsym {to_i3_form(key)} {command}\n"
     if mode == "default":
-        text = text.rstrip("\n") + "\n\n" + line
-    else:
-        pattern = re.compile(
-            r'(^mode\s+["\']?' + re.escape(mode) + r'["\']?\s*\{[^}]*)(\})',
-            re.MULTILINE | re.DOTALL
-        )
-        m = pattern.search(text)
-        if not m:
-            die(f"mode '{mode}' not found in config")
-        text = text[:m.start(2)] + "    " + line + text[m.start(2):]
-    config_path.write_text(text)
+        return text.rstrip("\n") + "\n\n" + line
+    pattern = re.compile(
+        r'(^mode\s+["\']?' + re.escape(mode) + r'["\']?\s*\{[^}]*)(\})',
+        re.MULTILINE | re.DOTALL,
+    )
+    m = pattern.search(text)
+    if not m:
+        raise BindError(f"mode '{mode}' not found in config")
+    return text[:m.start(2)] + "    " + line + text[m.start(2):]
 
-def do_delete(key, mode, config_path):
-    mod_var      = get_mod_var(config_path)
+def _apply_delete(text, key, mode, mod_var):
+    """Delete a binding (comment it out). Returns new text. Raises if not found."""
     target_norm  = normalize_key(key, mod_var)
-    lines        = config_path.read_text().splitlines(keepends=True)
+    lines        = text.splitlines(keepends=True)
     current_mode = "default"
     brace_depth  = 0
     target       = None
@@ -180,11 +200,35 @@ def do_delete(key, mode, config_path):
                 target = i
                 break
     if target is None:
-        return False
-    backup(config_path)
+        suffix = f" in mode {mode}" if mode != "default" else ""
+        raise BindError(f"binding not found: {key}{suffix}")
     lines[target] = "# [deleted] " + lines[target]
-    config_path.write_text("".join(lines))
-    return True
+    return "".join(lines)
+
+def _apply_op(text, line, mode, mod_var):
+    """Parse and apply a single batch line. Returns new text."""
+    parts = line.split(None, 2)
+    op = parts[0].lower()
+    if op == "add":
+        if len(parts) < 3:
+            raise BindError(f"add requires KEY and COMMAND: {line!r}")
+        return _apply_add(text, parts[1], parts[2], mode, mod_var)
+    if op in ("del", "delete", "rm"):
+        if len(parts) != 2:
+            raise BindError(f"del requires exactly KEY: {line!r}")
+        return _apply_delete(text, parts[1], mode, mod_var)
+    raise BindError(f"unknown op {op!r} (expected add or del)")
+
+# ── File-level wrappers ───────────────────────────────────────────────────────
+def get_mod_var(config_path):
+    return _get_mod_var_text(config_path.read_text())
+
+def iter_bindings(config_path):
+    text = config_path.read_text()
+    yield from _iter_bindings_text(text, _get_mod_var_text(text))
+
+def backup(config_path):
+    shutil.copy2(config_path, config_path.with_suffix(".bak"))
 
 def reload_i3():
     subprocess.Popen(["i3-msg", "reload"],
@@ -208,19 +252,30 @@ def cmd_list(args):
 def cmd_add(args):
     config = find_config(args.config)
     mode = args.mode or "default"
-    do_add(args.key, args.command, mode, config)
+    text = config.read_text()
+    mod_var = _get_mod_var_text(text)
+    try:
+        new_text = _apply_add(text, args.key, args.command, mode, mod_var)
+    except BindError as e:
+        die(str(e))
+    backup(config)
+    config.write_text(new_text)
     suffix = f"  (mode: {mode})" if mode != "default" else ""
-    print(f"added: bindsym {args.key} {args.command}{suffix}")
+    print(f"added: bindsym {to_i3_form(args.key)} {args.command}{suffix}")
     if not args.no_reload:
         reload_i3()
 
 def cmd_delete(args):
     config = find_config(args.config)
     mode = args.mode or "default"
-    ok = do_delete(args.key, mode, config)
-    if not ok:
-        suffix = f" in mode {mode}" if mode != "default" else ""
-        die(f"binding not found: {args.key}{suffix}")
+    text = config.read_text()
+    mod_var = _get_mod_var_text(text)
+    try:
+        new_text = _apply_delete(text, args.key, mode, mod_var)
+    except BindError as e:
+        die(str(e))
+    backup(config)
+    config.write_text(new_text)
     suffix = f"  (mode: {mode})" if mode != "default" else ""
     print(f"deleted: {args.key}{suffix}")
     if not args.no_reload:
@@ -231,6 +286,44 @@ def cmd_modes(args):
     seen = dict.fromkeys(mode for mode, *_ in iter_bindings(config))
     for m in seen:
         print(m)
+
+def cmd_batch(args):
+    """Apply a series of add/del ops atomically from stdin.
+
+    Each non-blank, non-comment line is one op:
+        add KEY COMMAND...
+        del KEY        (also: delete, rm)
+
+    The whole batch runs in memory; the file is written once at the end.
+    If any op fails (unknown modifier, duplicate, missing target), nothing
+    is written and i3 is not reloaded.
+    """
+    config = find_config(args.config)
+    mode = args.mode or "default"
+    text = config.read_text()
+    mod_var = _get_mod_var_text(text)
+
+    ops_applied = 0
+    lineno = 0
+    try:
+        for lineno, raw in enumerate(sys.stdin, 1):
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            text = _apply_op(text, line, mode, mod_var)
+            ops_applied += 1
+    except BindError as e:
+        die(f"batch line {lineno}: {e} (no changes written)")
+
+    if ops_applied == 0:
+        print("batch: no operations")
+        return
+
+    backup(config)
+    config.write_text(text)
+    print(f"batch applied: {ops_applied} op{'s' if ops_applied != 1 else ''}")
+    if not args.no_reload:
+        reload_i3()
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 def main():
@@ -260,6 +353,11 @@ def main():
 
     p_modes = sub.add_parser("modes")
     p_modes.set_defaults(func=cmd_modes)
+
+    p_batch = sub.add_parser(
+        "batch",
+        help="Apply add/del ops from stdin atomically (one per line)")
+    p_batch.set_defaults(func=cmd_batch)
 
     args = parser.parse_args()
     if args.command is None:

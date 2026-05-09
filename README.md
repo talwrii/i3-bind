@@ -18,9 +18,11 @@ List bindings:
 
 Create a binding:
 
-`i3-bind meta+shift+n gtk-launch focus-obsidina.desktop`
+`i3-bind add meta+shift+n gtk-launch focus-obsidina.desktop`
 
 Run reload after you run the command. I have a keybinding in i3 for reload.
+
+Sometimes when defining keybindings you can get collisions and then end up needing to move a "chain" of keys to get the keybindings you want. `batch` is provided for these cases. This performs a number of actions but does not commit any changes if there are any errors.
 
 
 ## About
